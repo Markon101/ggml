@@ -34,7 +34,9 @@ kernel void kernel_im2col_f16(
     // Fast path for 1D convolution (OH == 1 && KH == 1)
     if (OH == 1 && KH == 1) {
         int chw = (int)(gid % CHW);
-        int ix  = (int)(gid / CHW);
+        int spatial = (int)(gid / CHW);
+        int ix  = spatial % (int)OW;
+        int batch_idx = spatial / (int)OW;
         int ic  = chw / (int)KW;
         int kx  = chw % (int)KW;
 
@@ -42,7 +44,7 @@ kernel void kernel_im2col_f16(
         if (iiw < 0 || iiw >= (int)IW) {
             dst[gid] = 0.0f;
         } else {
-            ulong offset_src = (ulong)ic * delta_offset;
+            ulong offset_src = (ulong)ic * delta_offset + (ulong)batch_idx * batch_offset;
             dst[gid] = (half)src1[offset_src + iiw];
         }
         return;
