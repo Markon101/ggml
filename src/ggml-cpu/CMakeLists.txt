@@ -159,6 +159,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                     set(CMAKE_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS_SAVE})
                 endmacro()
 
+                check_arm_feature(fp16    FP16_VECTOR_ARITHMETIC "#include <arm_neon.h>\nint main() { float16x8_t _a = vdupq_n_f16(1.0f); volatile float16x8_t _b = vaddq_f16(_a, _a); return 0; }")
+                check_arm_feature(fp16fml FP16_FML               "#include <arm_neon.h>\nint main() { float32x4_t _acc = vdupq_n_f32(0.0f); float16x8_t _a = vdupq_n_f16(1.0f); volatile float32x4_t _r = vfmlalq_low_f16(_acc, _a, _a); return 0; }")
                 check_arm_feature(dotprod DOTPROD     "#include <arm_neon.h>\nint main() { int8x16_t _a, _b; volatile int32x4_t _s = vdotq_s32(_s, _a, _b); return 0; }")
                 check_arm_feature(i8mm    MATMUL_INT8 "#include <arm_neon.h>\nint main() { int8x16_t _a, _b; volatile int32x4_t _s = vmmlaq_s32(_s, _a, _b); return 0; }")
                 check_arm_feature(sve     SVE         "#include <arm_sve.h>\nint main()  { svfloat32_t _a, _b; volatile svfloat32_t _c = svadd_f32_z(svptrue_b8(), _a, _b); return 0; }")

@@ -6105,7 +6105,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
             std::vector<VkCooperativeMatrixPropertiesKHR> cm_props;
 
             PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR pfn_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR =
-                (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)vkGetInstanceProcAddr(vk_instance.instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+                (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)ggml_vk_default_dispatcher().vkGetInstanceProcAddr(vk_instance.instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
 
             uint32_t cm_props_num;
 
@@ -6580,6 +6580,21 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher() {
     return ggml_vk_default_dispatcher_instance;
 }
 
+#if defined(__ANDROID__)
+#include <dlfcn.h>
+static PFN_vkGetInstanceProcAddr ggml_vk_get_android_proc_addr() {
+    const char * use_termux = getenv("GGML_VK_USE_TERMUX_LOADER");
+    if (!use_termux || use_termux[0] != '1') {
+        void * sys_vk = dlopen("/system/lib64/libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+        if (sys_vk) {
+            auto fn = (PFN_vkGetInstanceProcAddr)dlsym(sys_vk, "vkGetInstanceProcAddr");
+            if (fn) return fn;
+        }
+    }
+    return vkGetInstanceProcAddr;
+}
+#endif
+
 static void ggml_vk_instance_init() {
     if (vk_instance_initialized) {
         return;
@@ -6587,7 +6602,13 @@ static void ggml_vk_instance_init() {
     VK_LOG_DEBUG("ggml_vk_instance_init()");
 
     // See https://github.com/KhronosGroup/Vulkan-Hpp?tab=readme-ov-file#extensions--per-device-function-pointers-
-    ggml_vk_default_dispatcher_instance.init(vkGetInstanceProcAddr);
+#if defined(__ANDROID__)
+    PFN_vkGetInstanceProcAddr pfn_gipa = ggml_vk_get_android_proc_addr();
+    ggml_vk_default_dispatcher_instance.init(pfn_gipa);
+#else
+    PFN_vkGetInstanceProcAddr pfn_gipa = vkGetInstanceProcAddr;
+    ggml_vk_default_dispatcher_instance.init(pfn_gipa);
+#endif
 
     uint32_t api_version = vk::enumerateInstanceVersion();
 
@@ -6644,12 +6665,12 @@ static void ggml_vk_instance_init() {
 
     if (debug_utils_ext) {
         vk_instance.debug_utils_support              = true;
-        vk_instance.pfn_vkSetDebugUtilsObjectNameEXT = (PFN_vkSetDebugUtilsObjectNameEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkSetDebugUtilsObjectNameEXT");
-        vk_instance.pfn_vkQueueBeginDebugUtilsLabelEXT = (PFN_vkQueueBeginDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkQueueBeginDebugUtilsLabelEXT");
-        vk_instance.pfn_vkQueueEndDebugUtilsLabelEXT = (PFN_vkQueueEndDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkQueueEndDebugUtilsLabelEXT");
-        vk_instance.pfn_vkCmdBeginDebugUtilsLabelEXT = (PFN_vkCmdBeginDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkCmdBeginDebugUtilsLabelEXT");
-        vk_instance.pfn_vkCmdEndDebugUtilsLabelEXT =   (PFN_vkCmdEndDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkCmdEndDebugUtilsLabelEXT");
-        vk_instance.pfn_vkCmdInsertDebugUtilsLabelEXT = (PFN_vkCmdInsertDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkCmdInsertDebugUtilsLabelEXT");
+        vk_instance.pfn_vkSetDebugUtilsObjectNameEXT = (PFN_vkSetDebugUtilsObjectNameEXT) pfn_gipa(vk_instance.instance, "vkSetDebugUtilsObjectNameEXT");
+        vk_instance.pfn_vkQueueBeginDebugUtilsLabelEXT = (PFN_vkQueueBeginDebugUtilsLabelEXT) pfn_gipa(vk_instance.instance, "vkQueueBeginDebugUtilsLabelEXT");
+        vk_instance.pfn_vkQueueEndDebugUtilsLabelEXT = (PFN_vkQueueEndDebugUtilsLabelEXT) pfn_gipa(vk_instance.instance, "vkQueueEndDebugUtilsLabelEXT");
+        vk_instance.pfn_vkCmdBeginDebugUtilsLabelEXT = (PFN_vkCmdBeginDebugUtilsLabelEXT) pfn_gipa(vk_instance.instance, "vkCmdBeginDebugUtilsLabelEXT");
+        vk_instance.pfn_vkCmdEndDebugUtilsLabelEXT =   (PFN_vkCmdEndDebugUtilsLabelEXT) pfn_gipa(vk_instance.instance, "vkCmdEndDebugUtilsLabelEXT");
+        vk_instance.pfn_vkCmdInsertDebugUtilsLabelEXT = (PFN_vkCmdInsertDebugUtilsLabelEXT) pfn_gipa(vk_instance.instance, "vkCmdInsertDebugUtilsLabelEXT");
     }
 
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;

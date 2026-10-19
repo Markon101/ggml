@@ -1,9 +1,9 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
 kernel void kernel_im2col_f16(
-        global float * src1,
+        global const float * src1,
         ulong offset1,
-        global half  * dst,
+        global half        * dst,
         ulong offsetd,
         ulong batch_offset,
         ulong delta_offset,
@@ -14,7 +14,7 @@ kernel void kernel_im2col_f16(
         long OH,
         long KW,
         long KH,
-        long pelements,
+        long total_elements,
         long CHW,
         int  s0,
         int  s1,
@@ -23,35 +23,52 @@ kernel void kernel_im2col_f16(
         int  d0,
         int  d1
 ) {
-    long i = get_global_id(0);
-    if (i >= pelements) {
+    long gid = get_global_id(0);
+    if (gid >= total_elements) {
         return;
     }
 
-    src1 = (global float*)((global char*)src1 + offset1);
-    dst = (global half*)((global char*)dst + offsetd);
+    src1 = (global const float*)((global const char*)src1 + offset1);
+    dst  = (global half*)((global char*)dst + offsetd);
 
-    long  ksize = OW * KH;
-    long  kx = i / ksize;
-    long  kd = kx * ksize;
-    long  ky = (i - kd) / OW;
-    long  ix = i % OW;
+    // Fast path for 1D convolution (OH == 1 && KH == 1)
+    if (OH == 1 && KH == 1) {
+        int chw = (int)(gid % CHW);
+        int ix  = (int)(gid / CHW);
+        int ic  = chw / (int)KW;
+        int kx  = chw % (int)KW;
 
-    long  oh = get_group_id(1);
-    long  batch = get_group_id(2) / IC;
-    long  ic = get_group_id(2) % IC;
+        int iiw = ix * s0 + kx * d0 - p0;
+        if (iiw < 0 || iiw >= (int)IW) {
+            dst[gid] = 0.0f;
+        } else {
+            ulong offset_src = (ulong)ic * delta_offset;
+            dst[gid] = (half)src1[offset_src + iiw];
+        }
+        return;
+    }
+
+    // General 2D path with coalesced destination writes
+    long chw = gid % CHW;
+    long spatial = gid / CHW;
+    long ix = spatial % OW;
+    long batch_oh = spatial / OW;
+    long oh = batch_oh % OH;
+    long batch = batch_oh / OH;
+
+    long kw_kh = KW * KH;
+    long ic = chw / kw_kh;
+    long k_rem = chw % kw_kh;
+    long ky = k_rem / KW;
+    long kx = k_rem % KW;
 
     long iiw = ix * s0 + kx * d0 - p0;
     long iih = oh * s1 + ky * d1 - p1;
 
-    long offset_dst =
-        ((batch * OH + oh) * OW + ix) * CHW +
-        (ic * (KW * KH) + ky * KW + kx);
-
     if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
-        dst[offset_dst] = 0.0f;
+        dst[gid] = 0.0f;
     } else {
-        long offset_src = ic * delta_offset + batch * batch_offset;
-        dst[offset_dst] = src1[offset_src + iih * IW + iiw];
+        ulong offset_src = (ulong)ic * delta_offset + (ulong)batch * batch_offset;
+        dst[gid] = (half)src1[offset_src + iih * IW + iiw];
     }
 }

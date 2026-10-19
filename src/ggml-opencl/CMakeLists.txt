@@ -171,6 +171,9 @@ set(GGML_OPENCL_KERNELS
     softmax_4_f16
     softmax_f32
     softmax_f16
+    sin
+    cos
+    conv_transpose_1d
     sqr
     sqrt
     ssm_conv
