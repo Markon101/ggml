@@ -879,6 +879,73 @@ inline std::string read_file(const std::string &path) {
     return text;
 }
 
+// Opt-in program cache. Full identity comparison makes filename-hash
+// collisions a cache miss; invalid binaries always fall back to source.
+static std::string ggml_cl_binary_identity(cl_device_id dev, const char * source, const std::string & opts) {
+    std::string identity(source);
+    identity.push_back('\0'); identity += opts; identity.push_back('\0');
+    for (cl_device_info field : { CL_DEVICE_NAME, CL_DEVICE_VENDOR, CL_DRIVER_VERSION, CL_DEVICE_VERSION, CL_DEVICE_OPENCL_C_VERSION }) {
+        size_t size = 0;
+        if (clGetDeviceInfo(dev, field, 0, nullptr, &size) != CL_SUCCESS || size > 65536) return {};
+        std::string value(size, '\0');
+        if (clGetDeviceInfo(dev, field, size, &value[0], nullptr) != CL_SUCCESS) return {};
+        identity += value;
+    }
+    return identity;
+}
+static std::string ggml_cl_binary_path(const char * dir, const std::string & identity) {
+    uint64_t key = UINT64_C(14695981039346656037);
+    for (unsigned char byte : identity) { key ^= byte; key *= UINT64_C(1099511628211); }
+    char name[32]; snprintf(name, sizeof(name), "%016" PRIx64 ".clbin", key);
+    return std::string(dir) + "/" + name;
+}
+static cl_program ggml_cl_binary_load(cl_context ctx, cl_device_id dev,
+        const std::string & path, const std::string & identity, const std::string & opts) {
+    FILE * file = fopen(path.c_str(), "rb");
+    if (!file) return nullptr;
+    uint64_t magic = 0, identity_size = 0, binary_size = 0;
+    bool ok = fread(&magic, sizeof(magic), 1, file) == 1 && magic == UINT64_C(0x51434c42494e3031) &&
+        fread(&identity_size, sizeof(identity_size), 1, file) == 1 && identity_size == identity.size() && identity_size < 4 * 1024 * 1024;
+    std::string saved_identity(ok ? identity_size : 0, '\0');
+    if (ok) ok = fread(&saved_identity[0], 1, identity_size, file) == identity_size && saved_identity == identity;
+    if (ok) ok = fread(&binary_size, sizeof(binary_size), 1, file) == 1 && binary_size > 0 && binary_size < 128 * 1024 * 1024;
+    std::vector<unsigned char> bytes(ok ? binary_size : 0);
+    if (ok) ok = fread(bytes.data(), 1, binary_size, file) == binary_size;
+    fclose(file);
+    if (!ok) return nullptr;
+    cl_int status = 0, err = 0;
+    const unsigned char * data = bytes.data();
+    size_t size = bytes.size();
+    cl_program program = clCreateProgramWithBinary(ctx, 1, &dev, &size, &data, &status, &err);
+    if (err != CL_SUCCESS || status != CL_SUCCESS || !program) {
+        if (program) clReleaseProgram(program);
+        return nullptr;
+    }
+    if (clBuildProgram(program, 1, &dev, opts.c_str(), nullptr, nullptr) != CL_SUCCESS) {
+        clReleaseProgram(program); return nullptr;
+    }
+    return program;
+}
+static void ggml_cl_binary_save(cl_program program, const std::string & path, const std::string & identity) {
+    cl_uint devices = 0;
+    if (clGetProgramInfo(program, CL_PROGRAM_NUM_DEVICES, sizeof(devices), &devices, nullptr) != CL_SUCCESS || devices != 1) return;
+    size_t size = 0;
+    if (clGetProgramInfo(program, CL_PROGRAM_BINARY_SIZES, sizeof(size), &size, nullptr) != CL_SUCCESS || !size || size > 128 * 1024 * 1024) return;
+    std::vector<unsigned char> bytes(size);
+    unsigned char * data = bytes.data();
+    if (clGetProgramInfo(program, CL_PROGRAM_BINARIES, sizeof(data), &data, nullptr) != CL_SUCCESS) return;
+    std::string temporary = path + ".tmp." + std::to_string(ggml_time_us());
+    FILE * file = fopen(temporary.c_str(), "wb");
+    if (!file) return;
+    const uint64_t magic = UINT64_C(0x51434c42494e3031), id_size = identity.size(), bin_size = bytes.size();
+    bool ok = fwrite(&magic, sizeof(magic), 1, file) == 1 && fwrite(&id_size, sizeof(id_size), 1, file) == 1 &&
+        fwrite(identity.data(), 1, identity.size(), file) == identity.size() && fwrite(&bin_size, sizeof(bin_size), 1, file) == 1 &&
+        fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
+    if (fclose(file) != 0) ok = false;
+    if (ok) { if (rename(temporary.c_str(), path.c_str()) != 0) remove(temporary.c_str()); }
+    else remove(temporary.c_str());
+}
+
 static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts) {
     cl_program p;
     char *program_log;
@@ -886,6 +953,20 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
     size_t log_size;
     int err;
 
+    const char * cache_dir = getenv("GGML_OPENCL_BINARY_CACHE_DIR");
+    std::string cache_identity, cache_path;
+    if (cache_dir && cache_dir[0]) {
+        cache_identity = ggml_cl_binary_identity(dev, program_buffer, compile_opts);
+        if (!cache_identity.empty()) {
+            cache_path = ggml_cl_binary_path(cache_dir, cache_identity);
+            cl_program cached = ggml_cl_binary_load(ctx, dev, cache_path, cache_identity, compile_opts);
+            if (cached) {
+                if (getenv("GGML_OPENCL_BINARY_CACHE_DEBUG")) fprintf(stderr, "OpenCL binary cache HIT %s\n", cache_path.c_str());
+                return cached;
+            }
+            if (getenv("GGML_OPENCL_BINARY_CACHE_DEBUG")) fprintf(stderr, "OpenCL binary cache MISS %s\n", cache_path.c_str());
+        }
+    }
     program_size = strlen(program_buffer);
 
     p = clCreateProgramWithSource(ctx, 1, (const char**)&program_buffer, &program_size, &err);
@@ -905,6 +986,7 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
         exit(1);
     }
 
+    if (!cache_path.empty()) ggml_cl_binary_save(p, cache_path, cache_identity);
     return p;
 }
 
