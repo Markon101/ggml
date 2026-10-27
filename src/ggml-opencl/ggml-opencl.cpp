@@ -385,6 +385,18 @@ struct ggml_backend_opencl_device_context {
 };
 
 // backend context
+// Optional QCOM recording experiment. API ABI documented by Qualcomm/MNN.
+using ggml_cl_recording = void *;
+using ggml_cl_new_recording_fn = ggml_cl_recording (CL_API_CALL *)(cl_command_queue, cl_int *);
+using ggml_cl_end_recording_fn = cl_int (CL_API_CALL *)(ggml_cl_recording);
+using ggml_cl_replay_fn = cl_int (CL_API_CALL *)(cl_command_queue, ggml_cl_recording,
+        size_t, const void *, size_t, const void *, size_t, const void *,
+        size_t, const void *, cl_uint, const cl_event *, cl_event *);
+struct ggml_cl_record_entry {
+    ggml_cl_recording recording = nullptr;
+    std::vector<cl_mem> buffers;
+};
+
 struct ggml_backend_opencl_context {
     int ref_count;
 
@@ -432,6 +444,16 @@ struct ggml_backend_opencl_context {
 
     cl_context context;
     cl_command_queue queue;
+    cl_command_queue record_queue = nullptr;
+    ggml_cl_new_recording_fn new_recording = nullptr;
+    ggml_cl_end_recording_fn end_recording = nullptr;
+    ggml_cl_end_recording_fn release_recording = nullptr;
+    ggml_cl_replay_fn replay_recording = nullptr;
+    std::map<std::vector<uint8_t>, ggml_cl_record_entry> recordings;
+    size_t recording_hits = 0;
+    size_t recording_misses = 0;
+    size_t recording_rejects = 0;
+
 
     // prealloc buffers for transposing weights and activations
     ggml_cl_buffer prealloc_quant_trans;
@@ -853,6 +875,15 @@ struct ggml_backend_opencl_context {
 
         ref_count--;
         if (ref_count == 0) {
+            if (record_queue) {
+                GGML_LOG_INFO("QCOM recordings: created=%zu hits=%zu\n", recording_misses, recording_hits);
+                for (auto & item : recordings) {
+                    CL_CHECK(release_recording(item.second.recording));
+                    for (cl_mem buffer : item.second.buffers) CL_CHECK(clReleaseMemObject(buffer));
+                }
+                recordings.clear();
+                recording_hits = recording_misses = 0;
+            }
 #ifdef GGML_OPENCL_PROFILING
             write_profiling_info();
             profiling_results.clear();
@@ -4382,6 +4413,20 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
 #endif
     CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
+    if (getenv("GGML_OPENCL_QCOM_RECORD") && backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
+        auto get = [&](const char * name) { return clGetExtensionFunctionAddressForPlatform(dev_ctx->platform, name); };
+        backend_ctx->new_recording = (ggml_cl_new_recording_fn) get("clNewRecordingQCOM");
+        backend_ctx->end_recording = (ggml_cl_end_recording_fn) get("clEndRecordingQCOM");
+        backend_ctx->release_recording = (ggml_cl_end_recording_fn) get("clReleaseRecordingQCOM");
+        backend_ctx->replay_recording = (ggml_cl_replay_fn) get("clEnqueueRecordingQCOM");
+        if (backend_ctx->new_recording && backend_ctx->end_recording &&
+            backend_ctx->release_recording && backend_ctx->replay_recording) {
+            backend_ctx->record_queue = clCreateCommandQueue(context, device, (cl_command_queue_properties) (1u << 30), &err);
+            if (err != CL_SUCCESS) backend_ctx->record_queue = nullptr;
+        }
+        GGML_LOG_INFO("OpenCL experiment: QCOM recording %s\n", backend_ctx->record_queue ? "enabled" : "unavailable");
+    }
+
 
     // delay kernel loading until the first buffer is created
     // load_cl_kernels(backend_ctx.get());
@@ -5146,9 +5191,86 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 
+// Exact serialized key, not a hash: includes operations, shape/stride/offset,
+// source associations and actual allocation identities. Retained CL buffers
+// prevent handle recycling from making a stale recording match a later graph.
+static bool ggml_cl_record_key(ggml_backend_opencl_context * ctx, ggml_cgraph * graph,
+        std::vector<uint8_t> & key, std::vector<cl_mem> & buffers) {
+    if (!ctx->record_queue || graph->n_nodes < 150 || graph->n_nodes > 300 ||
+        ggml_graph_get_tensor(graph, "logits") == nullptr) return false;
+    key.reserve(256 * 1024);
+    auto append = [&](const void * value, size_t size) {
+        const uint8_t * bytes = static_cast<const uint8_t *>(value);
+        key.insert(key.end(), bytes, bytes + size);
+    };
+    auto tensor = [&](const ggml_tensor * t) -> bool {
+        bool present = t != nullptr;
+        append(&present, sizeof(present));
+        if (!t) return true;
+        append(&t->type, sizeof(t->type));
+        append(t->ne, sizeof(t->ne));
+        append(t->nb, sizeof(t->nb));
+        append(&t->view_offs, sizeof(t->view_offs));
+        if (!t->extra) {
+            if (ctx->recording_rejects++ < 4) fprintf(stderr, "QCOM recording skip: no extra for %s (%s)\n", t->name, ggml_op_name(t->op));
+            return false;
+        }
+        auto add_buffer = [&](cl_mem buffer) {
+            append(&buffer, sizeof(buffer));
+            if (buffer && std::find(buffers.begin(), buffers.end(), buffer) == buffers.end()) buffers.push_back(buffer);
+        };
+        if (t->type == GGML_TYPE_Q8_0) {
+            auto * e = static_cast<ggml_tensor_extra_cl_q8_0 *>(t->extra);
+            if (!e->q || !e->d) return false;
+            add_buffer(e->q); add_buffer(e->d);
+        } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_I32) {
+            auto * e = static_cast<ggml_tensor_extra_cl *>(t->extra);
+            if (!e->data_device) return false;
+            add_buffer(e->data_device);
+            append(&e->offset, sizeof(e->offset));
+        } else return false;
+        return true;
+    };
+    append(&graph->n_nodes, sizeof(graph->n_nodes));
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        auto * node = graph->nodes[i];
+        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
+            (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) continue;
+        append(&node->op, sizeof(node->op));
+        append(node->op_params, sizeof(node->op_params));
+        append(&node->flags, sizeof(node->flags));
+        if (!tensor(node)) return false;
+        for (const ggml_tensor * src : node->src) if (!tensor(src)) return false;
+    }
+    return true;
+}
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
     static std::map<std::string, std::pair<int64_t, int64_t>> g_profile_stats;
+    std::vector<uint8_t> record_key;
+    std::vector<cl_mem> record_buffers;
+    ggml_cl_recording recording = nullptr;
+    cl_command_queue execute_queue = backend_ctx->queue;
+    const bool recordable = ggml_cl_record_key(backend_ctx, cgraph, record_key, record_buffers);
+    if (recordable) {
+        auto found = backend_ctx->recordings.find(record_key);
+        if (found != backend_ctx->recordings.end()) {
+            CL_CHECK(backend_ctx->replay_recording(execute_queue, found->second.recording,
+                    0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, nullptr));
+            backend_ctx->recording_hits++;
+            if (backend_ctx->recording_hits == 1 || backend_ctx->recording_hits % 256 == 0)
+                fprintf(stderr, "QCOM recording replay hits=%zu cached=%zu\n", backend_ctx->recording_hits, backend_ctx->recordings.size());
+            return GGML_STATUS_SUCCESS;
+        }
+        if (backend_ctx->recordings.size() < 32) {
+            cl_int err;
+            recording = backend_ctx->new_recording(backend_ctx->record_queue, &err);
+            CL_CHECK(err);
+            backend_ctx->queue = backend_ctx->record_queue;
+        }
+    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -5200,6 +5322,20 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+
+    if (recording) {
+        backend_ctx->queue = execute_queue;
+        CL_CHECK(backend_ctx->end_recording(recording));
+        for (cl_mem buffer : record_buffers) CL_CHECK(clRetainMemObject(buffer));
+        ggml_cl_record_entry entry;
+        entry.recording = recording;
+        entry.buffers = std::move(record_buffers);
+        backend_ctx->recordings.emplace(std::move(record_key), std::move(entry));
+        backend_ctx->recording_misses++;
+        fprintf(stderr, "QCOM recorded graph nodes=%d key_bytes=%zu buffers=%zu cached=%zu\n", cgraph->n_nodes, backend_ctx->recordings.rbegin()->first.size(), backend_ctx->recordings.rbegin()->second.buffers.size(), backend_ctx->recordings.size());
+        CL_CHECK(backend_ctx->replay_recording(execute_queue, recording,
+                0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, nullptr));
     }
 
     if (getenv("GGML_PROFILE_OPS") != nullptr && cgraph->n_nodes > 100) {
