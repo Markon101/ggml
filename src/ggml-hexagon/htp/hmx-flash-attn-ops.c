@@ -371,6 +371,21 @@ static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) 
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, start);
     hmx_interleave_rows_to_tiles(factx->vtcm_k_tiles, factx->vtcm_k_fp16[args->buf_idx], total_rows, (int) factx->DK,
                              (int) args->src_stride, start, end);
+    if (factx->use_pipeline) {
+        // K interleave scatters are issued by these HVX workers, but the next
+        // QK job consumes the tiles on the separate HMX queue thread. Complete
+        // every producer's touched region before worker completion publishes it.
+        // Integer-address scatter intrinsics also need a compiler barrier.
+        __asm__ __volatile__("" ::: "memory");
+        const size_t k_tiles = factx->DK / HMX_FP16_TILE_N_COLS;
+        for (int row_tile = start / HMX_FP16_TILE_N_ROWS;
+             row_tile <= (end - 1) / HMX_FP16_TILE_N_ROWS; ++row_tile) {
+            for (size_t kt = 0; kt < k_tiles; ++kt) {
+                (void) *(volatile HVX_Vector *) (factx->vtcm_k_tiles +
+                    (row_tile * k_tiles + kt) * HMX_FP16_TILE_N_ELMS);
+            }
+        }
+    }
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, start);
 }
 
