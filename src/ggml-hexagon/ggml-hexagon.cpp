@@ -2671,7 +2671,9 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
-            if (src0->ne[0] % 32) {
+            // Activation quantizers emit full 128-byte halves; shorter tails
+            // can exceed the allocated row stride and overwrite another row.
+            if (src0->ne[0] % 128) {
                 return false;
             }
 
@@ -2743,7 +2745,7 @@ static bool ggml_hexagon_supported_mul_mat_id(const struct ggml_hexagon_session 
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
-            if ((src0->ne[0] % 32)) {
+            if ((src0->ne[0] % 128)) {
                 return false;
             }
 
