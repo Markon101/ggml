@@ -3998,7 +3998,39 @@ static inline void quantize_block_f32_q8_1x1(float * restrict x, uint8_t * restr
     y_d_half[7] = (float) sums[24] * d3;
 }
 
-static inline void quantize_block_f32_q8x1(float * restrict x, uint8_t * restrict y_q, uint8_t * restrict y_d) {
+// Keep finite large activations in FP32 until after normalization. The fast
+// FP16 path below overflows before division when abs(x) > 65504 (observed in
+// Qwen3-TTS predictor FFNs). The Q8 scale can still be representable in FP16.
+// Preserve the ordinary fast path and use scalar FP32 quantization only for
+// those rare blocks. Quant bytes remain contiguous and scales repeat per QK8_0.
+static inline bool quantize_large_block_f32_q8(const float * x, uint8_t * y_q,
+                                               uint8_t * y_d, unsigned group) {
+    const HVX_Vector * vx = (const HVX_Vector *) x;
+    HVX_Vector m = hvx_vec_reduce_max2_f32(hvx_vec_abs_f32(vx[0]), hvx_vec_abs_f32(vx[1]));
+    m = hvx_vec_reduce_max2_f32(m, hvx_vec_abs_f32(vx[2]));
+    m = hvx_vec_reduce_max2_f32(m, hvx_vec_abs_f32(vx[3]));
+    if (hvx_vec_get_f32(m) <= 65504.0f) return false;
+
+    for (unsigned first = 0; first < 128; first += group) {
+        float amax = 0;
+        for (unsigned j = first; j < first + group; ++j) amax = fmaxf(amax, fabsf(x[j]));
+        const __fp16 d = (__fp16) (amax / 127.0f);
+        const float inv = d != 0 ? 1.0f / (float) d : 0;
+        for (unsigned j = first; j < first + group; ++j) {
+            float q = roundf(x[j] * inv);
+            q = fminf(127.0f, fmaxf(-127.0f, q));
+            y_q[j] = (uint8_t) (int8_t) q;
+        }
+        // y_d can alias already-consumed x; write it after this group's input.
+        for (unsigned j = first / 32; j < (first + group) / 32; ++j) {
+            ((__fp16 *) y_d)[j] = d;
+        }
+    }
+    return true;
+}
+
+static inline void quantize_block_f32_q8x1(float * x, uint8_t * restrict y_q, uint8_t * y_d) {
+    if (quantize_large_block_f32_q8(x, y_q, y_d, 32)) return;
     assert((unsigned long) x % 128 == 0);
     assert((unsigned long) y_q % 128 == 0);
 
@@ -4057,7 +4089,8 @@ static inline void quantize_block_f32_q8x1(float * restrict x, uint8_t * restric
     *(HVX_Vector *) y_q = vx_i8;
 }
 
-static inline void quantize_block_f32_q8x2(float * restrict x, uint8_t * restrict y_q, uint8_t * restrict y_d) {
+static inline void quantize_block_f32_q8x2(float * x, uint8_t * restrict y_q, uint8_t * y_d) {
+    if (quantize_large_block_f32_q8(x, y_q, y_d, 64)) return;
     assert((unsigned long) x % 128 == 0);
     assert((unsigned long) y_q % 128 == 0);
 
@@ -4100,7 +4133,8 @@ static inline void quantize_block_f32_q8x2(float * restrict x, uint8_t * restric
     *(HVX_Vector *) y_q = vx_i8;
 }
 
-static inline void quantize_block_f32_q8x4(float * restrict x, uint8_t * restrict y_q, uint8_t * restrict y_d) {
+static inline void quantize_block_f32_q8x4(float * x, uint8_t * restrict y_q, uint8_t * y_d) {
+    if (quantize_large_block_f32_q8(x, y_q, y_d, 128)) return;
     assert((unsigned long) x % 128 == 0);
     assert((unsigned long) y_q % 128 == 0);
 
