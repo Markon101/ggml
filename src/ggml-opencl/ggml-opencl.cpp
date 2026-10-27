@@ -832,6 +832,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q4_1_f32;
     cl_kernel kernel_gemm_noshuffle_q4_1_f32;
     cl_kernel kernel_gemm_noshuffle_q8_0_f32;
+    cl_kernel kernel_q8_small2 = nullptr;
     cl_kernel kernel_gemv_noshuffle_q8_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_k_f32;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
@@ -3369,6 +3370,21 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q8_0_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q8_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
+    }
+
+    if (getenv("GGML_OPENCL_Q8_SMALL2")) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string source {
+            #include "q8_small2.cl.h"
+        };
+#else
+        const std::string source = read_file("q8_small2.cl");
+#endif
+        const std::string opts = compile_opts;
+        cl_program prog = build_program_from_source(backend_ctx->context, backend_ctx->device, source.c_str(), opts);
+        CL_CHECK((backend_ctx->kernel_q8_small2 = clCreateKernel(prog, "kernel_q8_small2", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_INFO("\nOpenCL experiment: Q8 two-token kernel enabled\n");
     }
 
     // gemv_noshuffle_general_q8_0_f32
@@ -13526,6 +13542,19 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         size_t global_work_size_t[2] = { (size_t)width_B, (size_t)padded_height_B };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size_t, local_work_size_t, dst);
 
+        if (backend_ctx->kernel_q8_small2 && N == 2 && M % 64 == 0) {
+            kernel = backend_ctx->kernel_q8_small2;
+            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra0_q8_0->q));
+            CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra0_q8_0->d));
+            CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &b_img_trans));
+            CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &K));
+            CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &M));
+            CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &offsetd));
+            size_t global[] = { (size_t) M, 1, 1 };
+            size_t local[] = { 64, 1, 1 };
+            backend_ctx->enqueue_ndrange_kernel(kernel, 3, global, local, dst);
+        } else {
         // gemm
         kernel = backend_ctx->kernel_gemm_noshuffle_q8_0_f32;
         int padded_N = N + padding;
@@ -13544,6 +13573,8 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         size_t local_work_size[]  = { 2, 128, 1 };
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+        }
 
         CL_CHECK(clReleaseMemObject(b_img_trans));
         CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
