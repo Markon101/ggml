@@ -23,6 +23,10 @@
 #include "htp-drv.h"
 #include "libdl.h"
 
+#ifdef GGML_HEXAGON_USE_SPHAL
+#include <android/dlext.h>
+#endif
+
 #include <domain.h>
 
 //
@@ -62,7 +66,7 @@ typedef int (*fastrpc_munmap_pfn_t)(int domain, int fd, void *addr, size_t lengt
 
 typedef int (*remote_handle64_open_pfn_t)(const char* name, remote_handle64 *ph);
 typedef int (*remote_handle64_invoke_pfn_t)(remote_handle64 h, uint32_t dwScalars, remote_arg *pra);
-typedef int (*remote_handle64_close_pfn_t)(remote_handle h);
+typedef int (*remote_handle64_close_pfn_t)(remote_handle64 h);
 typedef int (*remote_handle_control_pfn_t)(uint32_t req, void* data, uint32_t datalen);
 typedef int (*remote_handle64_control_pfn_t)(remote_handle64 h, uint32_t req, void* data, uint32_t datalen);
 typedef int (*remote_session_control_pfn_t)(uint32_t req, void *data, uint32_t datalen);
@@ -320,7 +324,24 @@ int htpdrv_init() {
     GGML_LOG_INFO("ggml-hex: Loading driver %s\n", drv_path.c_str());
 
     fs::path path{ drv_path.c_str() };
+#ifdef GGML_HEXAGON_USE_SPHAL
+    using get_namespace_fn = android_namespace_t * (*)(const char *);
+    using open_ext_fn = void * (*)(const char *, int, const android_dlextinfo *);
+    auto get_namespace = reinterpret_cast<get_namespace_fn>(::dlsym(RTLD_DEFAULT, "__loader_android_get_exported_namespace"));
+    auto open_ext = reinterpret_cast<open_ext_fn>(::dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
+    android_namespace_t * sphal = get_namespace ? get_namespace("sphal") : nullptr;
+    if (!sphal || !open_ext) {
+        GGML_LOG_ERROR("ggml-hex: Android sphal namespace API unavailable\n");
+        return AEE_EUNABLETOLOAD;
+    }
+    android_dlextinfo ext = {};
+    ext.flags = ANDROID_DLEXT_USE_NAMESPACE;
+    ext.library_namespace = sphal;
+    path = "/vendor/lib64/libcdsprpc.so";
+    dl_handle_ptr handle { open_ext(path.c_str(), RTLD_NOW | RTLD_LOCAL, &ext) };
+#else
     dl_handle_ptr handle { dl_load_library(path) };
+#endif
     if (!handle) {
         GGML_LOG_ERROR("ggml-hex: failed to load %s: %s\n", path.u8string().c_str(), dl_error());
         return AEE_EUNABLETOLOAD;

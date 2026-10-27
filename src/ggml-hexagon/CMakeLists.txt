@@ -20,6 +20,9 @@ endif()
 message(STATUS "hexagon: using ${HEXAGON_SDK_ROOT} and ${HEXAGON_TOOLS_ROOT} for building libggml-htp skels")
 
 include(${HEXAGON_SDK_ROOT}/build/cmake/hexagon_fun.cmake)
+if (GGML_HEXAGON_QAIC_DIR)
+    set(proj-qaic_src "${GGML_HEXAGON_QAIC_DIR}")
+endif()
 include(ExternalProject)
 
 option(GGML_HEXAGON_HTP_DEBUG  "ggml-hexagon: enable HTP debug output" OFF)
@@ -56,14 +59,21 @@ ggml_add_backend_library(${TARGET_NAME}
     libdl.h
     ../../include/ggml-hexagon.h)
 
+option(GGML_HEXAGON_USE_SPHAL "Load Android CDSP through its exported sphal namespace" OFF)
+if (GGML_HEXAGON_USE_SPHAL)
+    target_compile_definitions(${TARGET_NAME} PRIVATE GGML_HEXAGON_USE_SPHAL)
+endif()
 target_link_libraries(${TARGET_NAME} PRIVATE htp_iface)
 target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/htp ${CMAKE_CURRENT_BINARY_DIR})
 
 # Build HTP skels
+set(GGML_HEXAGON_DSP_BUILD_JOBS "2" CACHE STRING "Maximum parallel DSP build jobs")
 set(HTP_SKELS)
 function(build_htp_skel V)
     ExternalProject_Add(htp-${V}
         SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/htp BUILD_ALWAYS ON
+        BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel ${GGML_HEXAGON_DSP_BUILD_JOBS}
+        INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR>
         BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/libggml-htp-${V}.so
         CMAKE_ARGS
             -DCMAKE_BUILD_TYPE=Release
@@ -74,17 +84,17 @@ function(build_htp_skel V)
             -DHEXAGON_HTP_DEBUG=${GGML_HEXAGON_HTP_DEBUG}
             -DGGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE=${GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE}
             -DDSP_VERSION=${V}
+            -DGGML_HEXAGON_QAIC_DIR=${GGML_HEXAGON_QAIC_DIR}
+            -DGGML_HEXAGON_EMULATION_DIR=${GGML_HEXAGON_EMULATION_DIR}
             -DPREBUILT_LIB_DIR="toolv19_${V}")
     list(APPEND HTP_SKELS ${CMAKE_CURRENT_BINARY_DIR}/libggml-htp-${V}.so)
     set(HTP_SKELS ${HTP_SKELS} PARENT_SCOPE)
 endfunction()
 
-build_htp_skel(v68)
-build_htp_skel(v69)
-build_htp_skel(v73)
-build_htp_skel(v75)
-build_htp_skel(v79)
-build_htp_skel(v81)
+set(GGML_HEXAGON_ARCHITECTURES "v68;v69;v73;v75;v79;v81" CACHE STRING "Hexagon DSP architectures to build")
+foreach(ARCH IN LISTS GGML_HEXAGON_ARCHITECTURES)
+    build_htp_skel(${ARCH})
+endforeach()
 
 # Install Hexagon skels required at runtime
 install(FILES ${HTP_SKELS} TYPE LIB)

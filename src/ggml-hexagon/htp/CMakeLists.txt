@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.22.2)
 project(ggml-htp C CXX ASM)
 
 include(${HEXAGON_SDK_ROOT}/build/cmake/hexagon_fun.cmake)
+if (GGML_HEXAGON_QAIC_DIR)
+    set(proj-qaic_src "${GGML_HEXAGON_QAIC_DIR}")
+endif()
 
 include_directories(
     ${HEXAGON_SDK_ROOT}/incs
