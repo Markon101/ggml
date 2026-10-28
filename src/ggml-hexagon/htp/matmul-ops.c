@@ -4751,6 +4751,11 @@ int op_matmul(struct htp_ops_context * octx) {
         return op_matmul_hvx(octx);
     }
 
+    // HMX only supports F32 activation (converts to FP16 internally)
+    if (src1->type != HTP_TYPE_F32) {
+        return op_matmul_hvx(octx);
+    }
+
     // HMX weight tile requires N to be 32-aligned.
     if (src0->ne[1] % 32 != 0) {
         return op_matmul_hvx(octx);
@@ -4848,10 +4853,10 @@ int op_matmul(struct htp_ops_context * octx) {
 
     if (ret != 0) {
         FARF(HIGH, "HMX matmul failed (ret=%d), falling back to HVX", ret);
-        return op_matmul(octx);
+        return op_matmul_hvx(octx);
     }
 
-    return 0;
+    return HTP_STATUS_OK;
 #endif // HTP_HAS_HMX
 }
 

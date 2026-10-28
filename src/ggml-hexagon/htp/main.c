@@ -572,6 +572,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_NEG:
         case HTP_OP_UNARY_EXP:
         case HTP_OP_UNARY_TANH:
+        case HTP_OP_SIN:
+        case HTP_OP_UNARY_RELU:
+        case HTP_OP_CLAMP:
         case HTP_OP_L2_NORM:
             return op_unary(octx);
 
@@ -762,7 +765,7 @@ static void prep_tensors(struct htp_context *ctx, struct htp_buf_desc *bufs, str
     }
 }
 
-static void proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx, struct htp_op_desc * op) {
+static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx, struct htp_op_desc * op) {
     memcpy(octx->op_params, op->params, sizeof(octx->op_params));
     octx->flags = op->flags;
     octx->op    = op->opcode;
@@ -793,7 +796,8 @@ static void proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, 
     FARF(HIGH, "prep-dst #%u: data %p size %u : %u:%u:%u:%u", op->dst, (void*) dst->data, dst->size,
         dst->ne[0], dst->ne[1], dst->ne[3], dst->ne[3]);
 
-    (void) execute_op(octx);
+    const int status = execute_op(octx);
+    if (status != HTP_STATUS_OK) return status;
 
     // flush buffers on output
     hex_l2flush((void *) dst->data, dst->size);
@@ -801,6 +805,7 @@ static void proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, 
 
     FARF(HIGH, "post-dst #%u: data %p size %u : %u:%u:%u:%u", op->dst, (void*) dst->data, dst->size,
         dst->ne[0], dst->ne[1], dst->ne[3], dst->ne[3]);
+    return HTP_STATUS_OK;
 }
 
 #define DSPQUEUE_POLL_TIMEOUT_USEC 100
@@ -892,6 +897,7 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
             }
         }
 
+        int batch_status = HTP_STATUS_OK;
         for (uint32_t i=0; i < n_ops; i++) {
             struct profile_data prof;
 
@@ -902,9 +908,14 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
 
             profile_start(ctx->profiler, &prof);
 
-            proc_op_req(octx, tens, i, &ops[i]);
+            memset(octx, 0, sizeof(*octx));
+            octx->n_threads = ctx->n_threads;
+            octx->ctx       = ctx;
+
+            batch_status = proc_op_req(octx, tens, i, &ops[i]);
 
             profile_stop(ctx->profiler, &prof);
+            if (batch_status != HTP_STATUS_OK) break;
 
             if (ctx->profiler) {
                 pds[i].opcode = ops[i].opcode;
@@ -919,7 +930,7 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
 
         struct htp_opbatch_rsp rsp;
         rsp.id        = req.id;
-        rsp.status    = HTP_STATUS_OK;
+        rsp.status    = batch_status;
         rsp.n_bufs    = n_bufs;
         rsp.n_tensors = n_tens;
         rsp.n_ops     = n_ops;

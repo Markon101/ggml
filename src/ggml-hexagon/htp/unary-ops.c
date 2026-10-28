@@ -11,6 +11,7 @@
 #include "hex-dma.h"
 #include "hvx-exp.h"
 #include "hvx-sigmoid.h"
+#include "hvx-sin-cos.h"
 #include "hvx-utils.h"
 
 #define GGML_COMMON_DECL_C
@@ -458,6 +459,61 @@ static void sigmoid_f32(const float * restrict src,
     }
 }
 
+// SIN uses the existing HVX polynomial only where its F32 argument reduction
+// is accurate. Large arguments use scalar double DSP libm, never host CPU.
+// A volatile function pointer prevents compiler float-builtin substitution.
+// Source/destination rows are aligned, padded VTCM DMA scratch; stores are
+// bounded to the logical tail. Scalar fallback never reads padding lanes.
+static void audio_pointwise_f32(const float * src,
+                                float * dst,
+                                uint32_t num_rows, uint32_t row_elems,
+                                size_t row_size, const int32_t * op_params,
+                                enum htp_op_code op) {
+    static double (*volatile scalar_sin)(double) = sin;
+    float lo = 0.0f, hi = INFINITY;
+    if (op == HTP_OP_CLAMP) {
+        memcpy(&lo, op_params, sizeof(float));
+        memcpy(&hi, op_params + 1, sizeof(float));
+    }
+    const HVX_Vector vlo = hvx_vec_splat_f32(lo);
+    const HVX_Vector vhi = hvx_vec_splat_f32(hi);
+    const HVX_Vector zero = Q6_V_vzero();
+    for (uint32_t row = 0; row < num_rows; ++row) {
+        const float * x = (const float *) ((const uint8_t *) src + row * row_size);
+        float * y = (float *) ((uint8_t *) dst + row * row_size);
+        for (uint32_t start = 0; start < row_elems; start += VLEN_FP32) {
+            const uint32_t count = MIN(VLEN_FP32, row_elems - start);
+            HVX_VectorAlias tail;
+            HVX_Vector vx;
+            if (count == VLEN_FP32) vx = hvx_vmemu(x + start);
+            else {
+                memset(&tail, 0, sizeof(tail));
+                memcpy(tail.fp32, x + start, count * sizeof(float));
+                vx = tail.v;
+            }
+            HVX_Vector vy;
+            if (op == HTP_OP_SIN) {
+                vy = hvx_vec_sin_f32(vx);
+            } else if (op == HTP_OP_UNARY_RELU) {
+                vy = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VsfVsf(vx, zero), vx, zero);
+            } else {
+                vy = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VsfVsf(vlo, vx), vlo, vx);
+                vy = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VsfVsf(vy, vhi), vhi, vy);
+            }
+            if (op == HTP_OP_SIN) {
+                HVX_VectorAlias input = {.v = vx}, result = {.v = vy};
+                for (uint32_t lane = 0; lane < count; ++lane) {
+                    const float value = input.fp32[lane];
+                    if (!(fabsf(value) <= 128.0f)) result.fp32[lane] = (float) scalar_sin((double) value);
+                }
+                vy = result.v;
+            }
+            // Input values have all been consumed before an in-place store.
+            hvx_vec_store_u(y + start, count * sizeof(float), vy);
+        }
+    }
+}
+
 static void tri_f32(const float * restrict src,
                     float * restrict dst,
                     uint8_t * restrict spad,
@@ -803,6 +859,11 @@ static void unary_job_f32_per_thread(unsigned int nth, unsigned int ith, void * 
             case HTP_OP_L2_NORM:
                 l2_norm_f32(src0_spad, dst_spad, NULL, block_size, ne0, src0_row_size_aligned, op_params);
                 break;
+            case HTP_OP_SIN:
+            case HTP_OP_UNARY_RELU:
+            case HTP_OP_CLAMP:
+                audio_pointwise_f32(src0_spad, dst_spad, block_size, ne0, src0_row_size_aligned, op_params, htp_op);
+                break;
             case HTP_OP_TRI:
                 tri_f32(src0_spad, dst_spad, NULL, block_size, ne00, src0_row_size_aligned, op_params, ir, uctx);
                 break;
@@ -847,6 +908,32 @@ static void unary_job_f32_per_thread(unsigned int nth, unsigned int ith, void * 
          dst->ne[3], (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
 }
 
+// Very wide waveform rows cannot reserve complete double-buffered row
+// scratch per worker. Pointwise ops have no cross-element dependency: divide
+// vector tiles over physical HVX workers and access shared DDR directly. Each
+// tail load is staged in a bounded 128-byte stack object, not past tensor end.
+static void audio_wide_job(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_ops_context * octx = data;
+    const struct htp_tensor * src = octx->src[0];
+    const struct htp_tensor * dst = octx->dst;
+    const uint64_t vectors_per_row = ((uint64_t) src->ne[0] + VLEN_FP32 - 1) / VLEN_FP32;
+    const uint64_t rows = (uint64_t) src->ne[1] * src->ne[2] * src->ne[3];
+    const uint64_t total = rows * vectors_per_row;
+    const uint64_t per_worker = (total + nth - 1) / nth;
+    const uint64_t start = per_worker * ith;
+    const uint64_t end = start + per_worker < total ? start + per_worker : total;
+    for (uint64_t tile = start; tile < end; ++tile) {
+        const uint32_t row = tile / vectors_per_row;
+        const uint32_t column = (tile % vectors_per_row) * VLEN_FP32;
+        const uint32_t count = MIN(VLEN_FP32, src->ne[0] - column);
+        const size_t src_offset = unary_row_offset(row, src->ne[1], src->ne[2], src->nb[1], src->nb[2], src->nb[3]);
+        const size_t dst_offset = unary_row_offset(row, dst->ne[1], dst->ne[2], dst->nb[1], dst->nb[2], dst->nb[3]);
+        audio_pointwise_f32((const float *) (src->data + src_offset) + column,
+                            (float *) (dst->data + dst_offset) + column,
+                            1, count, 0, octx->op_params, octx->op);
+    }
+}
+
 static int execute_op_unary_f32(struct htp_ops_context * octx) {
     int err = HTP_STATUS_OK;
 
@@ -854,6 +941,16 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
     const struct htp_tensor * dst  = octx->dst;
 
     const char * op_type = NULL;
+
+    if (src0->ne[0] > 65536 &&
+        (octx->op == HTP_OP_SIN || octx->op == HTP_OP_UNARY_RELU || octx->op == HTP_OP_CLAMP)) {
+        octx->src0_spad.src = NULL;
+        octx->src1_spad.src = NULL;
+        if (!(octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
+            worker_pool_run_func(octx->ctx->worker_pool, audio_wide_job, octx, octx->n_threads);
+        }
+        return HTP_STATUS_OK;
+    }
 
     switch (octx->op) {
         case HTP_OP_NORM:
@@ -891,6 +988,15 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
             break;
         case HTP_OP_L2_NORM:
             op_type = "l2norm-f32";
+            break;
+        case HTP_OP_SIN:
+            op_type = "sin-f32";
+            break;
+        case HTP_OP_UNARY_RELU:
+            op_type = "relu-f32";
+            break;
+        case HTP_OP_CLAMP:
+            op_type = "clamp-f32";
             break;
         case HTP_OP_TRI:
             op_type = "tri-f32";

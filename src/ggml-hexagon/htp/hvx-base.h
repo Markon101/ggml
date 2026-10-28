@@ -23,7 +23,8 @@ static inline void hvx_vec_store_u(void * restrict dst, uint32_t n, HVX_Vector v
     HVX_VectorPred qr     = Q6_Q_vsetq2_R(right_off);
 
     if (right_off > 128) {
-        Q6_vmem_QRIV(qr, (HVX_Vector *) dst + 1, v);
+        HVX_VectorPred qr2 = Q6_Q_vsetq2_R(right_off - 128);
+        Q6_vmem_QRIV(qr2, (HVX_Vector *) dst + 1, v);
         // all 1's
         qr = Q6_Q_vcmp_eq_VbVb(v, v);
     }

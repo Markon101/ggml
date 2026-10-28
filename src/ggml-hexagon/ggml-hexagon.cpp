@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <regex>
 #include <queue>
+#include <cmath>
 
 #ifdef _WIN32
 #    include <sal.h>
@@ -177,6 +178,18 @@ struct ggml_hexagon_session {
     ggml_hexagon_opbatch* op_batch;
     ggml_hexagon_opqueue* op_queue;
 
+    // Optional aggregate API accounting. These are logical tensor API bytes,
+    // not physical DDR traffic, DMA bytes, energy, or per-op trace events.
+    std::string transfer_trace;
+    mutable std::atomic<bool> transfer_trace_written{false};
+    std::atomic<uint64_t> tensor_set_calls{0}, tensor_set_bytes{0};
+    std::atomic<uint64_t> tensor_get_calls{0}, tensor_get_bytes{0};
+    std::atomic<uint64_t> repack_set_calls{0}, repack_set_bytes{0};
+    std::atomic<uint64_t> repack_get_calls{0}, repack_get_bytes{0};
+    std::atomic<uint64_t> batch_dispatches{0}, dispatched_operations{0};
+    std::atomic<uint64_t> flush_calls{0}, empty_flush_calls{0};
+    void write_transfer_trace() const noexcept;
+
     ggml_backend_buffer_type buffer_type        = {};
     ggml_backend_buffer_type repack_buffer_type = {};
 
@@ -194,6 +207,38 @@ struct ggml_hexagon_session {
     void flush_pending(bool all = false);
     void flush_batch();
 };
+
+// The existing registry owns heap sessions for process lifetime and is not
+// guaranteed to destroy them. Register aggregate emission at normal process
+// exit as well as explicit destruction; write-once prevents duplicate rows.
+static std::mutex & transfer_trace_mutex() {
+    static auto * mutex = new std::mutex;
+    return *mutex;
+}
+static std::vector<ggml_hexagon_session *> & transfer_trace_sessions() {
+    static auto * sessions = new std::vector<ggml_hexagon_session *>;
+    return *sessions;
+}
+static void write_process_transfer_traces() {
+    std::lock_guard<std::mutex> lock(transfer_trace_mutex());
+    for (auto * session : transfer_trace_sessions()) session->write_transfer_trace();
+}
+static void register_transfer_trace(ggml_hexagon_session * session) {
+    std::lock_guard<std::mutex> lock(transfer_trace_mutex());
+    static bool registered = false;
+    if (!registered) {
+        atexit(write_process_transfer_traces);
+        registered = true;
+    }
+    transfer_trace_sessions().push_back(session);
+}
+static void unregister_transfer_trace(ggml_hexagon_session * session) {
+    std::lock_guard<std::mutex> lock(transfer_trace_mutex());
+    auto & sessions = transfer_trace_sessions();
+    for (auto it = sessions.begin(); it != sessions.end(); ++it) {
+        if (*it == session) { sessions.erase(it); break; }
+    }
+}
 
 // ** backend buffers
 
@@ -1603,6 +1648,11 @@ static void repack_mxfp4x4x2_mxfp4(void * data, const ggml_tensor * t, size_t si
     ggml_aligned_free(buf_rp, row_size_rp);
 }
 
+static bool ggml_hexagon_repack_type(enum ggml_type type) {
+    return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 ||
+           type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_MXFP4;
+}
+
 static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                    ggml_tensor *         tensor,
                                                    const void *          data,
@@ -1610,6 +1660,15 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                    size_t                size) {
     auto sbuf = (ggml_hexagon_shared_buffer *) buffer->context;
     auto sess = sbuf->sess;
+
+    if (!sess->transfer_trace.empty()) {
+        sess->tensor_set_calls.fetch_add(1, std::memory_order_relaxed);
+        sess->tensor_set_bytes.fetch_add(size, std::memory_order_relaxed);
+        if (ggml_hexagon_repack_type(tensor->type)) {
+            sess->repack_set_calls.fetch_add(1, std::memory_order_relaxed);
+            sess->repack_set_bytes.fetch_add(size, std::memory_order_relaxed);
+        }
+    }
 
     HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu\n", sess->c_name(), tensor->name, data, offset, size);
 
@@ -1658,6 +1717,15 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                                                    size_t                size) {
     auto sbuf = (ggml_hexagon_shared_buffer *) buffer->context;
     auto sess = sbuf->sess;
+
+    if (!sess->transfer_trace.empty()) {
+        sess->tensor_get_calls.fetch_add(1, std::memory_order_relaxed);
+        sess->tensor_get_bytes.fetch_add(size, std::memory_order_relaxed);
+        if (ggml_hexagon_repack_type(tensor->type)) {
+            sess->repack_get_calls.fetch_add(1, std::memory_order_relaxed);
+            sess->repack_get_bytes.fetch_add(size, std::memory_order_relaxed);
+        }
+    }
 
     HEX_VERBOSE("ggml-hex: %s get-tensor %s : data %p offset %zu size %zu\n", sess->c_name(), tensor->name, data, offset, size);
 
@@ -2239,8 +2307,8 @@ void ggml_hexagon_session::flush_pending(bool all) {
         }
 
         if (rsp.status != HTP_STATUS_OK) {
-            GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp: %s\n", this->c_name(), status_to_str(rsp.status));
-            // TODO: handle errors
+            // A failed kernel leaves incomplete tensors and cannot be sampled.
+            GGML_ABORT("ggml-hex: %s dspcall failed: %s\n", this->c_name(), status_to_str(rsp.status));
         }
 
         op_queue->pop(rsp, dbuf);
@@ -2271,6 +2339,10 @@ void ggml_hexagon_session::flush_batch() {
     if (err != 0) {
         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
     }
+    if (!transfer_trace.empty()) {
+        batch_dispatches.fetch_add(1, std::memory_order_relaxed);
+        dispatched_operations.fetch_add(req.n_ops, std::memory_order_relaxed);
+    }
 }
 
 void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
@@ -2282,6 +2354,12 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
 
 // Flush HTP response queue i.e wait for all outstanding requests to complete
 void ggml_hexagon_session::flush(bool all) {
+    if (!transfer_trace.empty()) {
+        flush_calls.fetch_add(1, std::memory_order_relaxed);
+        if (op_batch->empty() && op_pending.load(std::memory_order_relaxed) == 0) {
+            empty_flush_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     flush_batch();
     flush_pending(all);
 }
@@ -2524,6 +2602,8 @@ void ggml_hexagon_session::release() noexcept(true) {
 }
 
 ggml_hexagon_session::ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) noexcept(false) {
+    const char * trace_path = getenv("GGML_HEXAGON_TRANSFER_TRACE");
+    if (trace_path && *trace_path) transfer_trace = trace_path;
     buffer_type.device        = dev;
     repack_buffer_type.device = dev;
 
@@ -2538,14 +2618,48 @@ ggml_hexagon_session::ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) n
 
         repack_buffer_type.iface   = ggml_backend_hexagon_repack_buffer_type_interface;
         repack_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(this->name + "-REPACK", this);
+        if (!transfer_trace.empty()) register_transfer_trace(this);
     } catch (const std::exception & exc) {
         release();
         throw;
     }
 }
 
+void ggml_hexagon_session::write_transfer_trace() const noexcept {
+    if (transfer_trace.empty() || transfer_trace_written.exchange(true)) return;
+    FILE * file = fopen(transfer_trace.c_str(), "a");
+    if (!file) {
+        GGML_LOG_ERROR("ggml-hex: cannot write aggregate transfer trace\n");
+        return;
+    }
+#ifdef _WIN32
+    const int pid = 0;
+#else
+    const int pid = (int) getpid();
+#endif
+    fprintf(file, "{\"kind\":\"htp_transfer_counters\",\"schema\":1,\"process_id\":%d,"
+                  "\"session_id\":%u,\"device_id\":%d,"
+                  "\"tensor_set_calls\":%" PRIu64 ",\"tensor_set_logical_bytes\":%" PRIu64 ","
+                  "\"tensor_get_calls\":%" PRIu64 ",\"tensor_get_logical_bytes\":%" PRIu64 ","
+                  "\"repack_set_calls\":%" PRIu64 ",\"repack_set_logical_bytes\":%" PRIu64 ","
+                  "\"repack_get_calls\":%" PRIu64 ",\"repack_get_logical_bytes\":%" PRIu64 ","
+                  "\"batch_dispatches\":%" PRIu64 ",\"dispatched_operations\":%" PRIu64 ","
+                  "\"flush_calls\":%" PRIu64 ",\"empty_flush_calls\":%" PRIu64 ","
+                  "\"physical_ddr_bytes_measured\":false}\n",
+            pid, session_id, dev_id,
+            tensor_set_calls.load(), tensor_set_bytes.load(),
+            tensor_get_calls.load(), tensor_get_bytes.load(),
+            repack_set_calls.load(), repack_set_bytes.load(),
+            repack_get_calls.load(), repack_get_bytes.load(),
+            batch_dispatches.load(), dispatched_operations.load(),
+            flush_calls.load(), empty_flush_calls.load());
+    if (fclose(file) != 0) GGML_LOG_ERROR("ggml-hex: aggregate transfer trace close failed\n");
+}
+
 ggml_hexagon_session::~ggml_hexagon_session() noexcept(true) {
     release();
+    write_transfer_trace();
+    if (!transfer_trace.empty()) unregister_transfer_trace(this);
 
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type.context);
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(repack_buffer_type.context);
@@ -2842,6 +2956,35 @@ static bool ggml_hexagon_supported_unary(const struct ggml_hexagon_session * ses
         return false;
     }
 
+    return true;
+}
+
+// NPU-Max pointwise operations reuse the F32 unary DMA path. Unlike the
+// historical unary predicate, reject element-strided rows explicitly. The
+// ordinary row scratch fits the v79 reservation; wide rows use bounded
+// direct-DDR HVX tiles rather than allocating full-row VTCM scratch.
+static bool ggml_hexagon_supported_audio_unary(const struct ggml_hexagon_session * sess,
+                                               const struct ggml_tensor * op) {
+    const struct ggml_tensor * src = op->src[0];
+    if (!src || src->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(src, op) || src->nb[0] != sizeof(float) ||
+        op->nb[0] != sizeof(float) || op->ne[0] <= 0 || op->ne[0] > 16777216 || ggml_nrows(op) <= 0) {
+        return false;
+    }
+    // Permit row padding (CLAMP is an in-place view), but reject overlapping
+    // or axis-permuted physical rows. DMA handles the higher-dimensional gaps.
+    for (const struct ggml_tensor * tensor : {src, op}) {
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+            if (tensor->nb[d] < tensor->nb[d - 1] * tensor->ne[d - 1]) return false;
+        }
+    }
+    if (op->op == GGML_OP_CLAMP) {
+        float bounds[2];
+        memcpy(bounds, op->op_params, sizeof(bounds));
+        if (!std::isfinite(bounds[0]) || !std::isfinite(bounds[1]) || bounds[0] > bounds[1]) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -3254,6 +3397,8 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_SOLVE_TRI:       return HTP_OP_SOLVE_TRI;
         case GGML_OP_TRI:             return HTP_OP_TRI;
         case GGML_OP_PAD:             return HTP_OP_PAD;
+        case GGML_OP_SIN:             return HTP_OP_SIN;
+        case GGML_OP_CLAMP:           return HTP_OP_CLAMP;
 
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(t)) {
@@ -3265,6 +3410,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
                 case GGML_UNARY_OP_EXP:        return HTP_OP_UNARY_EXP;
                 case GGML_UNARY_OP_SOFTPLUS:   return HTP_OP_UNARY_SOFTPLUS;
                 case GGML_UNARY_OP_TANH:       return HTP_OP_UNARY_TANH;
+                case GGML_UNARY_OP_RELU:       return HTP_OP_UNARY_RELU;
             default:
                 break;
             }
@@ -3735,8 +3881,16 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             supp = ggml_hexagon_supported_softmax(sess, op);
             break;
 
+        case GGML_OP_SIN:
+        case GGML_OP_CLAMP:
+            supp = ggml_hexagon_supported_audio_unary(sess, op);
+            break;
+
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
+                case GGML_UNARY_OP_RELU:
+                    supp = ggml_hexagon_supported_audio_unary(sess, op);
+                    break;
                 case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_EXP:
                 case GGML_UNARY_OP_SIGMOID:

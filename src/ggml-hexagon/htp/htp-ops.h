@@ -94,6 +94,11 @@ enum htp_op_code {
     HTP_OP_NORM,
     HTP_OP_CONCAT,
 
+    // NPU-Max extensions: append only; preserve all prior executable opcodes.
+    HTP_OP_SIN,
+    HTP_OP_UNARY_RELU,
+    HTP_OP_CLAMP,
+
     HTP_OP_INVALID
 };
 
