@@ -89,6 +89,52 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
     const uint32_t dr  = ct->src0_nrows_per_thread;                                                            \
     const uint32_t ir0 = dr * ith;                                                                             \
     const uint32_t ir1 = (ir0 + dr) < nr ? (ir0 + dr) : nr;                                                    \
+    if (ne0 == ne00 && ne1 == ne01 && ne2 == ne02 && ne3 == ne03) {                                            \
+        const bool split_cols = (nr < nth && ne00 >= nth);                                                     \
+        const uint32_t r0 = split_cols ? 0 : ir0;                                                              \
+        const uint32_t r1 = split_cols ? nr : ir1;                                                             \
+        const uint32_t dk = split_cols ? ((ne00 + nth - 1) / nth) : ne00;                                      \
+        const uint32_t k0 = split_cols ? (dk * ith) : 0;                                                       \
+        const uint32_t k1 = split_cols ? ((k0 + dk < ne00) ? (k0 + dk) : ne00) : ne00;                         \
+        if (r0 >= r1 || k0 >= k1) return;                                                                      \
+        for (uint32_t i03 = 0; i03 < ne03; i03++) {                                                            \
+            for (uint32_t i02 = 0; i02 < ne02; i02++) {                                                        \
+                const uint8_t * src_slice = (const uint8_t *) src0->data + i02 * nb02 + i03 * nb03;            \
+                uint8_t *       dst_slice = (uint8_t *)       dst->data  + i02 * nb2  + i03 * nb3;             \
+                if (nb00 == ELEM_SIZE && nb0 == ELEM_SIZE) {                                                   \
+                    for (uint32_t i01 = r0; i01 < r1; i01++) {                                                 \
+                        uint8_t *       dst_ptr = dst_slice + i01 * nb1 + k0 * ELEM_SIZE;                      \
+                        const uint8_t * src_ptr = src_slice + i01 * nb01 + k0 * ELEM_SIZE;                     \
+                        hex_l2fetch(src_ptr, (k1 - k0) * ELEM_SIZE, nb01, 2);                                  \
+                        hvx_copy_uu(dst_ptr, src_ptr, k1 - k0, ELEM_SIZE);                                     \
+                    }                                                                                          \
+                } else if (nb01 == ELEM_SIZE && nb0 == ELEM_SIZE) {                                            \
+                    const uint32_t TILE = 16;                                                                  \
+                    for (uint32_t i01_base = r0; i01_base < r1; i01_base += TILE) {                            \
+                        const uint32_t i01_end = (i01_base + TILE < r1) ? (i01_base + TILE) : r1;              \
+                        for (uint32_t k00_base = k0; k00_base < k1; k00_base += TILE) {                        \
+                            const uint32_t k00_end = (k00_base + TILE < k1) ? (k00_base + TILE) : k1;          \
+                            for (uint32_t i01 = i01_base; i01 < i01_end; i01++) {                              \
+                                ELEM_TYPE * dst_row = (ELEM_TYPE *) (dst_slice + i01 * nb1) + k00_base;        \
+                                for (uint32_t k00 = k00_base; k00 < k00_end; k00++) {                          \
+                                    dst_row[k00 - k00_base] = *(const ELEM_TYPE *) (src_slice + k00 * nb00 + i01 * ELEM_SIZE); \
+                                }                                                                              \
+                            }                                                                                  \
+                        }                                                                                      \
+                    }                                                                                          \
+                } else {                                                                                       \
+                    for (uint32_t i01 = r0; i01 < r1; i01++) {                                                 \
+                        const uint8_t * src_row = src_slice + i01 * nb01;                                      \
+                        uint8_t *       dst_row = dst_slice + i01 * nb1;                                       \
+                        for (uint32_t k00 = k0; k00 < k1; k00++) {                                             \
+                            *(ELEM_TYPE *) (dst_row + k00 * nb0) = *(const ELEM_TYPE *) (src_row + k00 * nb00);\
+                        }                                                                                      \
+                    }                                                                                          \
+                }                                                                                              \
+            }                                                                                                  \
+        }                                                                                                      \
+        return;                                                                                                \
+    }                                                                                                          \
     if (ir0 >= nr) return;                                                                                     \
     const bool src0_contig = (nb00 == ELEM_SIZE)   &&                                                          \
                              (nb01 == ne00 * nb00) &&                                                          \
@@ -235,8 +281,6 @@ static void cpy_thread_f32_f16_sameshape(unsigned int nth, unsigned int ith, voi
 int op_cpy(struct htp_ops_context * octx) {
     cpy_preamble;
 
-    const uint32_t n_threads = MIN(nr, octx->n_threads);
-
     struct htp_copy_context ct;
     ct.octx = octx;
 
@@ -260,7 +304,11 @@ int op_cpy(struct htp_ops_context * octx) {
 
     const bool sametype   = (src0->type == dst->type);
     const bool transposed = (nb00 > nb01) || (nb0 > nb1);
-    const bool sameshape  = !transposed && (ne00 == ne0 && ne01 == ne1 && ne02 == ne2 && ne03 == ne3);
+    const bool same_dims  = (ne00 == ne0 && ne01 == ne1 && ne02 == ne2 && ne03 == ne3);
+    const bool sameshape  = !transposed && same_dims;
+
+    const uint32_t max_par   = (sametype && !sameshape && same_dims && nr < octx->n_threads) ? MAX(nr, ne00) : nr;
+    const uint32_t n_threads = MIN(max_par, octx->n_threads);
 
     ct.src0_nrows_per_thread = (nr + n_threads - 1) / n_threads;
 

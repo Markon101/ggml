@@ -152,6 +152,111 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     }
 }
 
+static void concat_contiguous_rows(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_concat_context * cctx = (struct htp_concat_context *) data;
+    struct htp_ops_context * octx = cctx->octx;
+
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * src1 = octx->src[1];
+    const struct htp_tensor * dst  = octx->dst;
+
+    const int dim = cctx->dim;
+    const uint32_t type_size = (dst->type == HTP_TYPE_F32 || dst->type == HTP_TYPE_I32) ? 4 : 2;
+
+    const uint32_t ne0 = dst->ne[0];
+    const uint32_t ne1 = dst->ne[1];
+    const uint32_t ne2 = dst->ne[2];
+    const uint32_t ne3 = dst->ne[3];
+    const uint32_t total_rows = ne1 * ne2 * ne3;
+
+    if (total_rows == 0 || ne0 == 0) {
+        return;
+    }
+
+    if (total_rows >= nth) {
+        const uint32_t rows_per_thread = (total_rows + nth - 1) / nth;
+        const uint32_t start_row = MIN(ith * rows_per_thread, total_rows);
+        const uint32_t end_row   = MIN(start_row + rows_per_thread, total_rows);
+
+        for (uint32_t r = start_row; r < end_row; r++) {
+            const uint32_t r_div_ne1 = fastdiv(r, &cctx->div_ne1);
+            const uint32_t i1        = r - r_div_ne1 * ne1;
+            const uint32_t i3        = fastdiv(r_div_ne1, &cctx->div_ne2);
+            const uint32_t i2        = r_div_ne1 - i3 * ne2;
+
+            uint8_t * dst_row = (uint8_t *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2] + i1 * dst->nb[1];
+
+            if (dim == 0) {
+                const uint32_t n0 = src0->ne[0];
+                const uint32_t n1 = src1->ne[0];
+                uint8_t * src0_row = (uint8_t *) src0->data + i3 * src0->nb[3] + i2 * src0->nb[2] + i1 * src0->nb[1];
+                uint8_t * src1_row = (uint8_t *) src1->data + i3 * src1->nb[3] + i2 * src1->nb[2] + i1 * src1->nb[1];
+                if (n0 > 0) {
+                    hex_l2fetch(src0_row, n0 * type_size, src0->nb[1], 2);
+                    hvx_copy_uu(dst_row, src0_row, n0, type_size);
+                }
+                if (n1 > 0) {
+                    hex_l2fetch(src1_row, n1 * type_size, src1->nb[1], 2);
+                    hvx_copy_uu(dst_row + n0 * type_size, src1_row, n1, type_size);
+                }
+            } else {
+                const uint32_t idx_dim = (dim == 1) ? i1 : ((dim == 2) ? i2 : i3);
+                const struct htp_tensor * src = (idx_dim < src0->ne[dim]) ? src0 : src1;
+                const uint32_t s1 = (dim == 1 && src == src1) ? (i1 - src0->ne[1]) : i1;
+                const uint32_t s2 = (dim == 2 && src == src1) ? (i2 - src0->ne[2]) : i2;
+                const uint32_t s3 = (dim == 3 && src == src1) ? (i3 - src0->ne[3]) : i3;
+                uint8_t * src_row = (uint8_t *) src->data + s3 * src->nb[3] + s2 * src->nb[2] + s1 * src->nb[1];
+                hex_l2fetch(src_row, ne0 * type_size, src->nb[1], 2);
+                hvx_copy_uu(dst_row, src_row, ne0, type_size);
+            }
+        }
+    } else {
+        for (uint32_t r = 0; r < total_rows; r++) {
+            const uint32_t r_div_ne1 = fastdiv(r, &cctx->div_ne1);
+            const uint32_t i1        = r - r_div_ne1 * ne1;
+            const uint32_t i3        = fastdiv(r_div_ne1, &cctx->div_ne2);
+            const uint32_t i2        = r_div_ne1 - i3 * ne2;
+
+            uint8_t * dst_row = (uint8_t *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2] + i1 * dst->nb[1];
+
+            if (dim == 0) {
+                const uint32_t n0 = src0->ne[0];
+                const uint32_t n1 = src1->ne[0];
+                uint8_t * src0_row = (uint8_t *) src0->data + i3 * src0->nb[3] + i2 * src0->nb[2] + i1 * src0->nb[1];
+                uint8_t * src1_row = (uint8_t *) src1->data + i3 * src1->nb[3] + i2 * src1->nb[2] + i1 * src1->nb[1];
+
+                const uint32_t chunk0 = (n0 + nth - 1) / nth;
+                const uint32_t s0     = MIN(ith * chunk0, n0);
+                const uint32_t e0     = MIN(s0 + chunk0, n0);
+                if (e0 > s0) {
+                    hvx_copy_uu(dst_row + s0 * type_size, src0_row + s0 * type_size, e0 - s0, type_size);
+                }
+
+                const uint32_t chunk1 = (n1 + nth - 1) / nth;
+                const uint32_t s1     = MIN(ith * chunk1, n1);
+                const uint32_t e1     = MIN(s1 + chunk1, n1);
+                if (e1 > s1) {
+                    hvx_copy_uu(dst_row + (n0 + s1) * type_size, src1_row + s1 * type_size, e1 - s1, type_size);
+                }
+            } else {
+                const uint32_t idx_dim = (dim == 1) ? i1 : ((dim == 2) ? i2 : i3);
+                const struct htp_tensor * src = (idx_dim < src0->ne[dim]) ? src0 : src1;
+                const uint32_t s1 = (dim == 1 && src == src1) ? (i1 - src0->ne[1]) : i1;
+                const uint32_t s2 = (dim == 2 && src == src1) ? (i2 - src0->ne[2]) : i2;
+                const uint32_t s3 = (dim == 3 && src == src1) ? (i3 - src0->ne[3]) : i3;
+                uint8_t * src_row = (uint8_t *) src->data + s3 * src->nb[3] + s2 * src->nb[2] + s1 * src->nb[1];
+
+                const uint32_t chunk = (ne0 + nth - 1) / nth;
+                const uint32_t s0    = MIN(ith * chunk, ne0);
+                const uint32_t e0    = MIN(s0 + chunk, ne0);
+                if (e0 > s0) {
+                    hvx_copy_uu(dst_row + s0 * type_size, src_row + s0 * type_size, e0 - s0, type_size);
+                }
+            }
+        }
+    }
+}
+
 static void concat_generic(unsigned int nth, unsigned int ith, void * data) {
     struct htp_concat_context * cctx = (struct htp_concat_context *) data;
     struct htp_ops_context * octx = cctx->octx;
@@ -270,6 +375,8 @@ int op_concat(struct htp_ops_context * octx) {
         } else {
             worker_func = concat_2d_f16_transposed;
         }
+    } else if (src0->nb[0] == type_size && src1->nb[0] == type_size && dst->nb[0] == type_size) {
+        worker_func = concat_contiguous_rows;
     }
 
     worker_pool_run_func(octx->ctx->worker_pool, worker_func, &cctx, n_threads);

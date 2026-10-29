@@ -98,6 +98,7 @@ enum htp_op_code {
     HTP_OP_SIN,
     HTP_OP_UNARY_RELU,
     HTP_OP_CLAMP,
+    HTP_OP_DIAG_MASK_INF,
 
     HTP_OP_INVALID
 };

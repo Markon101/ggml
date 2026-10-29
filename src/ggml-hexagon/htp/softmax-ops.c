@@ -247,7 +247,7 @@ static void softmax_job_f32(unsigned int nth, unsigned int ith, void * data) {
     // Only use the fast path when aligned AND row size is multiple of VLEN (128 bytes)
     // The fast path (hvx_fast_softmax_f32) doesn't handle tail elements
     // The non-opt path uses hvx_softmax_f32 which properly handles all sizes via its helper functions
-    if ((1 == is_aligned) && !(nb01 & (VLEN - 1))) {
+    if ((1 == is_aligned) && !(nb01 & (VLEN - 1)) && !(ne00 & (VLEN_FP32 - 1))) {
         opt_path = 1;
     }
 

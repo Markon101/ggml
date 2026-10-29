@@ -3084,16 +3084,10 @@ static bool ggml_hexagon_supported_softmax(const struct ggml_hexagon_session * s
         }
     }
 
-    // Reject non-HVX-aligned sizes when ne[0] > HVX_F32_LANES
-    // The HVX softmax implementation has issues with tail handling for larger non-aligned sizes
-    // Small sizes (ne[0] <= 32) work correctly with tail-only processing
-    const int64_t ne0 = src0->ne[0];
-    if (ne0 > 32 && (ne0 & (32 - 1)) != 0) {
-        return false;
-    }
-
     // HVX vector size constraints for softmax
     #define SOFTMAX_MAX_ROW_SIZE 131072  // 128K elements max for numerical precision
+
+    const int64_t ne0 = src0->ne[0];
 
     // Reject very large row sizes to avoid numerical precision issues
     // Softmax accumulation over many elements can lead to precision loss
@@ -3396,6 +3390,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_DIAG:            return HTP_OP_DIAG;
         case GGML_OP_SOLVE_TRI:       return HTP_OP_SOLVE_TRI;
         case GGML_OP_TRI:             return HTP_OP_TRI;
+        case GGML_OP_DIAG_MASK_INF:   return HTP_OP_DIAG_MASK_INF;
         case GGML_OP_PAD:             return HTP_OP_PAD;
         case GGML_OP_SIN:             return HTP_OP_SIN;
         case GGML_OP_CLAMP:           return HTP_OP_CLAMP;
@@ -3981,6 +3976,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             break;
 
         case GGML_OP_TRI:
+        case GGML_OP_DIAG_MASK_INF:
             supp = ggml_hexagon_supported_tri(sess, op);
             break;
 

@@ -501,12 +501,20 @@ static void audio_pointwise_f32(const float * src,
                 vy = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VsfVsf(vy, vhi), vhi, vy);
             }
             if (op == HTP_OP_SIN) {
-                HVX_VectorAlias input = {.v = vx}, result = {.v = vy};
-                for (uint32_t lane = 0; lane < count; ++lane) {
-                    const float value = input.fp32[lane];
-                    if (!(fabsf(value) <= 128.0f)) result.fp32[lane] = (float) scalar_sin((double) value);
+                HVX_Vector vabs = Q6_V_vand_VV(vx, Q6_V_vsplat_R(0x7fffffff));
+                vabs = Q6_Vw_vmax_VwVw(vabs, Q6_V_vror_VR(vabs, 64));
+                vabs = Q6_Vw_vmax_VwVw(vabs, Q6_V_vror_VR(vabs, 32));
+                vabs = Q6_Vw_vmax_VwVw(vabs, Q6_V_vror_VR(vabs, 16));
+                vabs = Q6_Vw_vmax_VwVw(vabs, Q6_V_vror_VR(vabs, 8));
+                vabs = Q6_Vw_vmax_VwVw(vabs, Q6_V_vror_VR(vabs, 4));
+                if ((uint32_t) Q6_R_vextract_VR(vabs, 0) > 0x43000000u) {
+                    HVX_VectorAlias input = {.v = vx}, result = {.v = vy};
+                    for (uint32_t lane = 0; lane < count; ++lane) {
+                        const float value = input.fp32[lane];
+                        if (!(fabsf(value) <= 128.0f)) result.fp32[lane] = (float) scalar_sin((double) value);
+                    }
+                    vy = result.v;
                 }
-                vy = result.v;
             }
             // Input values have all been consumed before an in-place store.
             hvx_vec_store_u(y + start, count * sizeof(float), vy);
@@ -525,7 +533,8 @@ static void tri_f32(const float * restrict src,
                     const struct htp_unary_context * uctx) {
 
     const int32_t ttype = op_params[0];
-    const HVX_Vector zero = hvx_vec_splat_f32(0.0f);
+    const bool is_diag_mask_inf = (uctx->octx->op == HTP_OP_DIAG_MASK_INF);
+    const HVX_Vector zero = hvx_vec_splat_f32(is_diag_mask_inf ? -INFINITY : 0.0f);
     const uint32_t nvec  = row_elems / VLEN_FP32;
     const uint32_t nloe  = row_elems % VLEN_FP32;
 
@@ -540,14 +549,20 @@ static void tri_f32(const float * restrict src,
 
         uint32_t boundary;
         int      keep_left;
-        switch (ttype) {
-            case 0: boundary = i01;     keep_left = 0; break;  // keep col >= row
-            case 1: boundary = i01 + 1; keep_left = 0; break;  // keep col > row
-            case 2: boundary = i01 + 1; keep_left = 1; break;  // keep col <= row
-            case 3: boundary = i01;     keep_left = 1; break;  // keep col < row
-            default: boundary = 0; keep_left = 0; break;
+        if (is_diag_mask_inf) {
+            const int64_t bnd = (int64_t) ttype + (int64_t) i01 + 1;
+            boundary  = (bnd <= 0) ? 0u : (bnd > (int64_t) row_elems ? row_elems : (uint32_t) bnd);
+            keep_left = 1;
+        } else {
+            switch (ttype) {
+                case 0: boundary = i01;     keep_left = 0; break;  // keep col >= row
+                case 1: boundary = i01 + 1; keep_left = 0; break;  // keep col > row
+                case 2: boundary = i01 + 1; keep_left = 1; break;  // keep col <= row
+                case 3: boundary = i01;     keep_left = 1; break;  // keep col < row
+                default: boundary = 0; keep_left = 0; break;
+            }
+            if (boundary > row_elems) boundary = row_elems;
         }
-        if (boundary > row_elems) boundary = row_elems;
 
         // Full HVX vectors — each starts at a 128-byte aligned offset
         for (uint32_t i = 0; i < nvec; i++) {
@@ -865,6 +880,7 @@ static void unary_job_f32_per_thread(unsigned int nth, unsigned int ith, void * 
                 audio_pointwise_f32(src0_spad, dst_spad, block_size, ne0, src0_row_size_aligned, op_params, htp_op);
                 break;
             case HTP_OP_TRI:
+            case HTP_OP_DIAG_MASK_INF:
                 tri_f32(src0_spad, dst_spad, NULL, block_size, ne00, src0_row_size_aligned, op_params, ir, uctx);
                 break;
             default:
@@ -1000,6 +1016,9 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
             break;
         case HTP_OP_TRI:
             op_type = "tri-f32";
+            break;
+        case HTP_OP_DIAG_MASK_INF:
+            op_type = "diag-mask-inf-f32";
             break;
 
         default:

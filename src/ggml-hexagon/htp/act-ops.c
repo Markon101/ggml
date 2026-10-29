@@ -307,6 +307,9 @@ static void glu_swiglu_oai_f32_per_thread(unsigned int nth, unsigned int ith, vo
 }
 
 
+static const float GELU_COEF_A     = 0.044715f;
+static const float SQRT_2_OVER_PI  = 0.79788456080286535587989211986876f;
+
 static void unary_gelu_f32_per_thread(unsigned int nth, unsigned int ith, void * data) {
     struct htp_act_context * actx = (struct htp_act_context *) data;
     htp_act_preamble;
@@ -374,13 +377,19 @@ static void unary_gelu_f32_per_thread(unsigned int nth, unsigned int ith, void *
         float* src0_spad = (float *) dma_queue_pop(dma_queue).dst;
 
         for (uint32_t ib = 0; ib < block_size; ib++) {
-            const float* src0_spad_ptr = src0_spad + ib * (src0_row_size_aligned / sizeof(float));
-            float* dst_spad_ptr        = dst_spad  + ib * (dst_row_size_aligned  / sizeof(float));
+            const uint8_t * src0_spad_ptr = (const uint8_t *) (src0_spad + ib * (src0_row_size_aligned / sizeof(float)));
+            uint8_t *       dst_spad_ptr  = (uint8_t *) (dst_spad  + ib * (dst_row_size_aligned  / sizeof(float)));
 
-            // gelu = x * sigmoid(1.702 * x) // current implementation
-            hvx_mul_scalar_f32((uint8_t *) dst_spad_ptr, (const uint8_t *) src0_spad_ptr, (float) 1.702, ne0_val);
-            hvx_sigmoid_f32_aa((uint8_t *) dst_spad_ptr, (const uint8_t *) dst_spad_ptr, ne0_val);
-            hvx_mul_f32_aaa((uint8_t *) dst_spad_ptr, (const uint8_t *) src0_spad_ptr, (const uint8_t *) dst_spad_ptr, ne0_val);
+            // gelu(x) = 0.5f*x*(1.0f + tanhf(SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x*x)))
+            hvx_mul_f32_aaa(dst_spad_ptr, src0_spad_ptr, src0_spad_ptr, ne0_val);
+            hvx_mul_scalar_f32_aa(dst_spad_ptr, (const uint8_t *) dst_spad_ptr, GELU_COEF_A, ne0_val);
+            hvx_add_scalar_f32_aa(dst_spad_ptr, (const uint8_t *) dst_spad_ptr, 1.0f, ne0_val);
+            hvx_mul_f32_aaa(dst_spad_ptr, src0_spad_ptr, (const uint8_t *) dst_spad_ptr, ne0_val);
+            hvx_mul_scalar_f32_aa(dst_spad_ptr, (const uint8_t *) dst_spad_ptr, SQRT_2_OVER_PI, ne0_val);
+            hvx_tanh_f32_aa(dst_spad_ptr, (const uint8_t *) dst_spad_ptr, ne0_val);
+            hvx_add_scalar_f32_aa(dst_spad_ptr, (const uint8_t *) dst_spad_ptr, 1.0f, ne0_val);
+            hvx_mul_f32_aaa(dst_spad_ptr, src0_spad_ptr, (const uint8_t *) dst_spad_ptr, ne0_val);
+            hvx_mul_scalar_f32_aa(dst_spad_ptr, (const uint8_t *) dst_spad_ptr, 0.5f, ne0_val);
         }
 
         dma_queue_push_vtcm_to_ddr(dma_queue,
@@ -500,9 +509,6 @@ static void unary_silu_f32_per_thread(unsigned int nth, unsigned int ith, void *
     FARF(HIGH, "silu-f32 %d/%d: %ux%ux%ux%u (%u:%u) -> %ux%ux%ux%u usec %u\n", ith, nth, ne00, ne01, ne02,
          ne03, src0_start_row, src0_end_row, ne0, ne1, ne2, ne3, (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
 }
-
-static const float GELU_COEF_A     = 0.044715f;
-static const float SQRT_2_OVER_PI  = 0.79788456080286535587989211986876f;
 
 static void glu_geglu_f32_per_thread(unsigned int nth, unsigned int ith, void * data) {
     struct htp_act_context * actx = (struct htp_act_context *) data;
