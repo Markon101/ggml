@@ -657,7 +657,7 @@ static inline bool reuse_buf(struct htp_context *ctx, uint32_t *m_reuse, struct 
         struct htp_mmap *m = ctx->mmap + i;
         if (m->size && m->fd == b->fd) {
             b->base   = m->base;
-            *m_reuse |= (1 << i);
+            *m_reuse |= (1u << i);
             return true;
         }
     }
@@ -727,16 +727,22 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
 
     if (b_reuse == n_bufs) return; // all bufs reuse existing mappings
 
-    // See how much vmem we have mmaped right now
-    for (uint32_t i=0; i<HTP_MAX_MMAPS; i++) { m_vmem += ctx->mmap[i].size; }
+    // See how much vmem and how many mmap slots we have mapped right now
+    uint32_t m_count = 0;
+    for (uint32_t i=0; i<HTP_MAX_MMAPS; i++) {
+        if (ctx->mmap[i].size) {
+            m_vmem += ctx->mmap[i].size;
+            m_count++;
+        }
+    }
 
-    FARF(HIGH, "prep-bufs : pass1 mmap-vmem %zu extra-vmem %zu max-vmem %zu : n-bufs %u b-reuse %u",
-            (size_t) m_vmem, (size_t) e_vmem, (size_t) ctx->max_vmem, n_bufs, b_reuse);
+    FARF(HIGH, "prep-bufs : pass1 mmap-vmem %zu extra-vmem %zu max-vmem %zu : n-bufs %u b-reuse %u m-count %u",
+            (size_t) m_vmem, (size_t) e_vmem, (size_t) ctx->max_vmem, n_bufs, b_reuse, m_count);
 
-    if ((m_vmem + e_vmem) > ctx->max_vmem) {
+    if ((m_vmem + e_vmem) > ctx->max_vmem || (m_count + (n_bufs - b_reuse)) > HTP_MAX_MMAPS) {
         // Drop unused mappings
         for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) {
-            bool used = m_reuse & (1<<i);
+            bool used = (m_reuse & (1u << i)) != 0;
             if (!used) { drop_mmap(ctx, ctx->mmap + i); }
         }
     }
@@ -830,6 +836,19 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
         uint32_t flags   = 0;
 
         err = dspqueue_read_noblock(queue, &flags, n_dbufs, &n_dbufs, &dbuf, r_size, &r_size, (uint8_t *) &req);
+        if (err == AEE_EWOULDBLOCK && poll_count == DSPQUEUE_POLL_COUNT) {
+            // Fast user-space spin-poll right after finishing a batch so back-to-back
+            // autoregressive decode steps do not incur a 100-250 us QuRT sleep penalty.
+            for (uint32_t spin = 0; spin < 512; ++spin) {
+                hex_pause();
+                n_dbufs = 1;
+                r_size  = sizeof(req);
+                err = dspqueue_read_noblock(queue, &flags, n_dbufs, &n_dbufs, &dbuf, r_size, &r_size, (uint8_t *) &req);
+                if (err != AEE_EWOULDBLOCK) {
+                    break;
+                }
+            }
+        }
         if (err == AEE_EWOULDBLOCK) {
             if (--poll_count) {
                 qurt_sleep(DSPQUEUE_POLL_TIMEOUT_USEC);
@@ -909,7 +928,23 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
 
             profile_start(ctx->profiler, &prof);
 
+            struct htp_spad prev_src1_spad = octx->src1_spad;
+            const bool keep_src1_spad =
+                i > 0 &&
+                ops[i - 1].opcode == HTP_OP_MUL_MAT &&
+                ops[i].opcode == HTP_OP_MUL_MAT &&
+                ops[i - 1].src[0] != 0xffff &&
+                ops[i].src[0] != 0xffff &&
+                tens[ops[i - 1].src[0]].type == tens[ops[i].src[0]].type &&
+                ops[i].src[1] != 0xffff &&
+                ops[i - 1].src[1] == ops[i].src[1] &&
+                ops[i - 1].dst != ops[i].src[1] &&
+                prev_src1_spad.src == &tens[ops[i].src[1]];
+
             memset(octx, 0, sizeof(*octx));
+            if (keep_src1_spad) {
+                octx->src1_spad = prev_src1_spad;
+            }
             octx->n_threads = ctx->n_threads;
             octx->ctx       = ctx;
 

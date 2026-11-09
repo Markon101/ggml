@@ -4718,7 +4718,7 @@ static int op_matmul_hvx(struct htp_ops_context * octx) {
     octx->src0_spad.data = octx->src1_spad.data + octx->src1_spad.size;
     octx->dst_spad.data  = octx->src0_spad.data + octx->src0_spad.size;
 
-    octx->src1_spad.src  = (src1 == octx->src1_spad.src) ? src1 : NULL;
+    octx->src1_spad.src  = (src1 == octx->src1_spad.src && octx->src1_spad.stride == src1_row_size) ? src1 : NULL;
     octx->src0_spad.src  = NULL;
     octx->dst_spad.src   = NULL;
 
@@ -4954,7 +4954,7 @@ int op_matmul_id(struct htp_ops_context * octx) {
     octx->src2_spad.data = octx->src0_spad.data + octx->src0_spad.size;
     octx->dst_spad.data  = octx->src2_spad.data + octx->src2_spad.size;
 
-    octx->src1_spad.src  = (src1 == octx->src1_spad.src) ? src1 : NULL;
+    octx->src1_spad.src  = (src1 == octx->src1_spad.src && octx->src1_spad.stride == src1_row_size) ? src1 : NULL;
     octx->src0_spad.src  = NULL;
     octx->src2_spad.src  = NULL;
     octx->dst_spad.src   = NULL;

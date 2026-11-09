@@ -14,7 +14,7 @@
 #include <stdbool.h>
 
 #define HTP_MAX_NTHREADS 10
-#define HTP_MAX_MMAPS    16
+#define HTP_MAX_MMAPS    32
 
 // Memory mapping
 struct htp_mmap {
