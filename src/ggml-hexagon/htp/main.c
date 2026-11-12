@@ -928,6 +928,10 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
 
             profile_start(ctx->profiler, &prof);
 
+            // Reusing the dynamically quantized src1 spad is only valid when the next op
+            // consumes the same src1 tensor AND would build the same spad layout. The
+            // layout depends on src0/dst dims (which pick the VTCM full/chunked branch),
+            // so require identical src0 and dst descriptors and no dst/src1 aliasing.
             struct htp_spad prev_src1_spad = octx->src1_spad;
             const bool keep_src1_spad =
                 i > 0 &&
@@ -935,11 +939,19 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
                 ops[i].opcode == HTP_OP_MUL_MAT &&
                 ops[i - 1].src[0] != 0xffff &&
                 ops[i].src[0] != 0xffff &&
-                tens[ops[i - 1].src[0]].type == tens[ops[i].src[0]].type &&
                 ops[i].src[1] != 0xffff &&
                 ops[i - 1].src[1] == ops[i].src[1] &&
                 ops[i - 1].dst != ops[i].src[1] &&
-                prev_src1_spad.src == &tens[ops[i].src[1]];
+                tens[ops[i - 1].src[0]].type == tens[ops[i].src[0]].type &&
+                prev_src1_spad.src == &tens[ops[i].src[1]] &&
+                prev_src1_spad.size != 0 &&
+                prev_src1_spad.size_per_thread != 0 &&
+                memcmp(tens[ops[i - 1].src[0]].ne, tens[ops[i].src[0]].ne, sizeof(tens[0].ne)) == 0 &&
+                memcmp(tens[ops[i - 1].src[0]].nb, tens[ops[i].src[0]].nb, sizeof(tens[0].nb)) == 0 &&
+                memcmp(tens[ops[i - 1].dst].ne, tens[ops[i].dst].ne, sizeof(tens[0].ne)) == 0 &&
+                memcmp(tens[ops[i - 1].dst].nb, tens[ops[i].dst].nb, sizeof(tens[0].nb)) == 0 &&
+                !(tens[ops[i - 1].dst].bi == tens[ops[i].src[1]].bi &&
+                  tens[ops[i - 1].dst].data == tens[ops[i].src[1]].data);
 
             memset(octx, 0, sizeof(*octx));
             if (keep_src1_spad) {
